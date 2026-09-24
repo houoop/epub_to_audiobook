@@ -1,14 +1,33 @@
 name: Build and Push Docker Image
 
+# 构建并发布镜像到 ghcr.io/houoop/epub_to_audiobook
+#
+# 三个关键设计：
+#   1. 直接 checkout **上游源码** 构建，再把本 fork 的 convert.py + entrypoint.sh
+#      叠加进去。GitHub fork 是静态快照，上游推新 commit 后 fork 不会自动跟进；
+#      这样构建就永远基于最新上游代码，无需 sync 机制。
+#   2. **不修改上游任何文件** —— 只替换 entrypoint.sh 并新增 convert.py。
+#      上游的 main.py / main_ui.py / audiobook_generator/ 全部原样保留。
+#   3. 只构建 linux/amd64（本机全是 x86；多架构走 QEMU 要十几分钟，amd64 约 1 分钟），
+#      且上游 commit 已构建过就跳过，避免每日空转刷同一个镜像。
+
 on:
+  schedule:
+    # 每天 UTC 04:37（北京 12:37）。避开整点高峰，降低 schedule 被丢弃的概率。
+    - cron: '37 4 * * *'
   workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: '上游 commit 未变也强制重建'
+        type: boolean
+        default: false
   push:
-    tags:
-      - '*'
+    tags: ['v*']
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  UPSTREAM_REPO: p0n1/epub_to_audiobook
+  UPSTREAM_REF: main
 
 jobs:
   build:
@@ -18,35 +37,81 @@ jobs:
       packages: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+          path: src
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+      - name: Checkout our files (this fork)
+        uses: actions/checkout@v4
+        with:
+          path: ours
+
+      - name: Record upstream commit
+        id: up
+        run: |
+          cd src
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # 叠加：只覆盖 entrypoint.sh、新增 convert.py，不动任何上游源码
+      - name: Overlay our entrypoint + convert script
+        run: |
+          cp ours/convert.py    src/convert.py
+          cp ours/entrypoint.sh src/entrypoint.sh
+          chmod +x src/entrypoint.sh
+          echo "=== 上游源码 + 本 fork 新增文件 ==="
+          ls -la src/convert.py src/entrypoint.sh
+          echo "=== 确认上游代码未被改动 ==="
+          cd src && git status --porcelain
+
+      # 镜像名必须全小写（github.repository 可能含大写）
+      - name: Compute image name (lowercase)
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether this upstream commit is already built
+        id: check
+        run: |
+          if docker manifest inspect \
+               "${{ steps.image.outputs.name }}:${{ steps.up.outputs.sha }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        if: steps.check.outputs.exists == 'false' || inputs.force_rebuild
+        uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v2
+      - name: Log in to GHCR
+        if: steps.check.outputs.exists == 'false' || inputs.force_rebuild
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # https://github.com/docker/metadata-action
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v4
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-
       - name: Build and push
-        uses: docker/build-push-action@v4
+        if: steps.check.outputs.exists == 'false' || inputs.force_rebuild
+        uses: docker/build-push-action@v6
         with:
-          context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest, ${{ steps.meta.outputs.tags }}, ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-          labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64,linux/arm64
+          context: ./src
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:${{ steps.up.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.check.outputs.exists }}" = "true" ] \
+             && [ "${{ inputs.force_rebuild }}" != "true" ]; then
+            echo "上游 \`${{ steps.up.outputs.short }}\` 已构建过，本次跳过。" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "已发布 \`${{ steps.image.outputs.name }}:latest\`（上游 ${{ steps.up.outputs.short }}）" >> "$GITHUB_STEP_SUMMARY"
+          fi
